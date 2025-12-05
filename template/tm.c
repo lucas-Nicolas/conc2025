@@ -95,6 +95,7 @@ typedef struct {
     bool            is_ro;
     uint32_t        tx_id;
     bool            aborted;
+    bool            cleaned_up;    // Prevent double cleanup
 
     // Write set for this transaction (for rollback on abort and commit)
     write_entry_t*  writes;
@@ -152,12 +153,19 @@ static void apply_epoch_changes(region_t* region);
 
 static void batcher_leave(batcher_t* b, region_t* region) {
     pthread_mutex_lock(&b->mutex);
+    uint64_t my_epoch = b->epoch;
     b->remaining--;
     if (b->remaining == 0) {
         // Last transaction in epoch - apply changes
         apply_epoch_changes(region);
-        // Move to next epoch
+        // Move to next epoch and wake waiting transactions
         b->epoch++;
+        pthread_cond_broadcast(&b->cond);
+    } else {
+        // Wait for epoch to complete so writes are visible when we return
+        while (b->epoch == my_epoch) {
+            pthread_cond_wait(&b->cond, &b->mutex);
+        }
     }
     pthread_mutex_unlock(&b->mutex);
 }
@@ -396,6 +404,9 @@ static bool tx_add_free(tx_internal_t* tx, segment_t* seg) {
 
 // Cleanup and leave batcher (called on abort or at end)
 static void tx_cleanup(tx_internal_t* tx, bool committed) {
+    if (tx->cleaned_up) return;  // Prevent double cleanup
+    tx->cleaned_up = true;
+
     region_t* region = tx->region;
 
     if (!committed && !tx->is_ro) {
@@ -616,6 +627,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     tx->is_ro = is_ro;
     tx->tx_id = atomic_fetch_add(&region->next_tx_id, 1);
     tx->aborted = false;
+    tx->cleaned_up = false;
 
     return (tx_t)tx;
 }
