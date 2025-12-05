@@ -151,7 +151,7 @@ static uint64_t batcher_enter(batcher_t* b) {
 // Forward declaration
 static void apply_epoch_changes(region_t* region);
 
-static void batcher_leave(batcher_t* b, region_t* region) {
+static void batcher_leave(batcher_t* b, region_t* region, bool is_ro) {
     pthread_mutex_lock(&b->mutex);
     uint64_t my_epoch = b->epoch;
     b->remaining--;
@@ -161,12 +161,13 @@ static void batcher_leave(batcher_t* b, region_t* region) {
         // Move to next epoch and wake waiting transactions
         b->epoch++;
         pthread_cond_broadcast(&b->cond);
-    } else {
-        // Wait for epoch to complete so writes are visible when we return
+    } else if (!is_ro) {
+        // RW transactions must wait for epoch to complete so writes are visible
         while (b->epoch == my_epoch) {
             pthread_cond_wait(&b->cond, &b->mutex);
         }
     }
+    // RO transactions can exit immediately - they don't need to see epoch writes
     pthread_mutex_unlock(&b->mutex);
 }
 
@@ -233,20 +234,20 @@ static void segment_destroy(segment_t* seg) {
     free(seg);
 }
 
-// Find segment containing pointer (no locking) - fast path for first segment
-static inline segment_t* find_segment_unlocked(region_t* region, const void* ptr) {
+// Find segment containing pointer (no locking)
+static segment_t* find_segment_unlocked(region_t* region, const void* ptr) {
     // Fast path: check first segment (most common case)
     segment_t* first = region->first_segment;
     const uint8_t* p = (const uint8_t*)ptr;
-    const uint8_t* base = (const uint8_t*)first->user_base;
-    if (likely(p >= base && p < base + first->size)) {
+    const uint8_t* first_base = (const uint8_t*)first->user_base;
+    if (p >= first_base && p < first_base + first->size) {
         return first;
     }
 
-    // Slow path: scan other segments
+    // Slow path: search all segments (including first again for simplicity)
     segment_t* seg = region->segments;
     while (seg) {
-        base = (const uint8_t*)seg->user_base;
+        const uint8_t* base = (const uint8_t*)seg->user_base;
         if (p >= base && p < base + seg->size) {
             return seg;
         }
@@ -255,16 +256,16 @@ static inline segment_t* find_segment_unlocked(region_t* region, const void* ptr
     return NULL;
 }
 
-// Get readable copy pointer for a word (relaxed ok - readable_copy only changes at epoch end)
+// Get readable copy pointer for a word
 static inline void* get_readable_copy(segment_t* seg, size_t word_idx, size_t align) {
-    uint8_t readable = atomic_load_explicit(&seg->readable_copy, memory_order_relaxed);
+    uint8_t readable = atomic_load(&seg->readable_copy);
     void* base = (readable == 0) ? seg->copy_a : seg->copy_b;
     return (uint8_t*)base + word_idx * align;
 }
 
-// Get writable copy pointer for a word (relaxed ok - readable_copy only changes at epoch end)
+// Get writable copy pointer for a word
 static inline void* get_writable_copy(segment_t* seg, size_t word_idx, size_t align) {
-    uint8_t readable = atomic_load_explicit(&seg->readable_copy, memory_order_relaxed);
+    uint8_t readable = atomic_load(&seg->readable_copy);
     void* base = (readable == 0) ? seg->copy_b : seg->copy_a;  // Opposite of readable
     return (uint8_t*)base + word_idx * align;
 }
@@ -450,7 +451,7 @@ static void tx_cleanup(tx_internal_t* tx, bool committed) {
     }
 
     // Leave batcher
-    batcher_leave(&region->batcher, region);
+    batcher_leave(&region->batcher, region, tx->is_ro);
 }
 
 static void tx_destroy(tx_internal_t* tx) {
@@ -458,6 +459,73 @@ static void tx_destroy(tx_internal_t* tx) {
     free(tx->allocs);
     free(tx->frees);
     free(tx);
+}
+
+// ============================================================================
+// Read/Write Word Logic
+// ============================================================================
+
+// Read a single word
+static bool read_word(tx_internal_t* tx, segment_t* seg, size_t word_idx, void* target) {
+    size_t align = tx->region->align;
+
+    if (tx->is_ro) {
+        // Read-only transaction: always read from readable copy
+        void* src = get_readable_copy(seg, word_idx, align);
+        memcpy(target, src, align);
+        return true;
+    }
+
+    // Read-write transaction
+    uint32_t owner = atomic_load(&seg->ctrl[word_idx]);
+
+    if (owner == CTRL_NONE) {
+        // Not written this epoch - read from readable copy
+        void* src = get_readable_copy(seg, word_idx, align);
+        memcpy(target, src, align);
+        return true;
+    } else if (owner == tx->tx_id) {
+        // Written by us - read from writable copy
+        void* src = get_writable_copy(seg, word_idx, align);
+        memcpy(target, src, align);
+        return true;
+    } else {
+        // Written by another tx - conflict
+        return false;
+    }
+}
+
+// Write a single word
+static bool write_word(tx_internal_t* tx, segment_t* seg, size_t word_idx, const void* source) {
+    size_t align = tx->region->align;
+
+    // Try to acquire ownership: NONE -> tx_id
+    uint32_t expected = CTRL_NONE;
+    if (atomic_compare_exchange_strong(&seg->ctrl[word_idx], &expected, tx->tx_id)) {
+        // Success! We now own this word
+        void* dst = get_writable_copy(seg, word_idx, align);
+        memcpy(dst, source, align);
+
+        // Add to local write set (will be registered at commit time)
+        if (!tx_add_write(tx, seg, word_idx)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // CAS failed - check who owns it
+    uint32_t owner = expected;  // CAS returns current value in expected on failure
+
+    if (owner == tx->tx_id) {
+        // We already own it - just write
+        void* dst = get_writable_copy(seg, word_idx, align);
+        memcpy(dst, source, align);
+        return true;
+    } else {
+        // Another tx owns it - conflict
+        return false;
+    }
 }
 
 // ============================================================================
@@ -555,30 +623,20 @@ size_t tm_align(shared_t shared) {
 tx_t tm_begin(shared_t shared, bool is_ro) {
     region_t* region = (region_t*)shared;
 
-    tx_internal_t* tx = (tx_internal_t*)malloc(sizeof(tx_internal_t));
-    if (unlikely(!tx)) {
+    // Allocate transaction first
+    tx_internal_t* tx = (tx_internal_t*)calloc(1, sizeof(tx_internal_t));
+    if (!tx) {
         return invalid_tx;
     }
-
-    // Initialize all fields
-    tx->writes = NULL;
-    tx->write_count = 0;
-    tx->write_cap = 0;
-    tx->allocs = NULL;
-    tx->alloc_count = 0;
-    tx->alloc_cap = 0;
-    tx->frees = NULL;
-    tx->free_count = 0;
-    tx->free_cap = 0;
 
     // Enter batcher
     batcher_enter(&region->batcher);
 
     tx->region = region;
     tx->is_ro = is_ro;
+    tx->tx_id = atomic_fetch_add(&region->next_tx_id, 1);
     tx->aborted = false;
     tx->cleaned_up = false;
-    tx->tx_id = is_ro ? 0 : atomic_fetch_add(&region->next_tx_id, 1);
 
     return (tx_t)tx;
 }
@@ -612,44 +670,24 @@ bool tm_read(shared_t unused(shared), tx_t tx_handle, void const* source, size_t
     tx_internal_t* tx = (tx_internal_t*)tx_handle;
     region_t* region = tx->region;
 
-    if (unlikely(tx->aborted)) return false;
+    if (tx->aborted) return false;
 
     // Find segment
     segment_t* seg = find_segment_unlocked(region, source);
-    if (unlikely(!seg)) {
+    if (!seg) {
         tx->aborted = true;
         tx_cleanup(tx, false);
         return false;
     }
 
-    size_t align = region->align;
+    // Calculate word range
     size_t offset = (const uint8_t*)source - (const uint8_t*)seg->user_base;
-    size_t start_word = offset / align;
-    size_t word_count = size / align;
+    size_t start_word = offset / region->align;
+    size_t word_count = size / region->align;
 
-    // Fast path for read-only transactions - just copy from readable
-    if (tx->is_ro) {
-        uint8_t readable = atomic_load_explicit(&seg->readable_copy, memory_order_relaxed);
-        void* base = (readable == 0) ? seg->copy_a : seg->copy_b;
-        memcpy(target, (uint8_t*)base + start_word * align, size);
-        return true;
-    }
-
-    // Read-write transaction: check ctrl for each word
-    uint8_t readable = atomic_load_explicit(&seg->readable_copy, memory_order_relaxed);
-    void* readable_base = (readable == 0) ? seg->copy_a : seg->copy_b;
-    void* writable_base = (readable == 0) ? seg->copy_b : seg->copy_a;
-    uint32_t tx_id = tx->tx_id;
-
+    // Read word by word
     for (size_t i = 0; i < word_count; i++) {
-        size_t word_idx = start_word + i;
-        uint32_t owner = atomic_load(&seg->ctrl[word_idx]);
-
-        if (likely(owner == CTRL_NONE)) {
-            memcpy((uint8_t*)target + i * align, (uint8_t*)readable_base + word_idx * align, align);
-        } else if (owner == tx_id) {
-            memcpy((uint8_t*)target + i * align, (uint8_t*)writable_base + word_idx * align, align);
-        } else {
+        if (!read_word(tx, seg, start_word + i, (uint8_t*)target + i * region->align)) {
             tx->aborted = true;
             tx_cleanup(tx, false);
             return false;
@@ -663,47 +701,24 @@ bool tm_write(shared_t unused(shared), tx_t tx_handle, void const* source, size_
     tx_internal_t* tx = (tx_internal_t*)tx_handle;
     region_t* region = tx->region;
 
-    if (unlikely(tx->aborted)) return false;
+    if (tx->aborted) return false;
 
     // Find segment
     segment_t* seg = find_segment_unlocked(region, target);
-    if (unlikely(!seg)) {
+    if (!seg) {
         tx->aborted = true;
         tx_cleanup(tx, false);
         return false;
     }
 
-    size_t align = region->align;
+    // Calculate word range
     size_t offset = (const uint8_t*)target - (const uint8_t*)seg->user_base;
-    size_t start_word = offset / align;
-    size_t word_count = size / align;
-    uint32_t tx_id = tx->tx_id;
-
-    // Hoist invariants out of loop
-    uint8_t readable = atomic_load_explicit(&seg->readable_copy, memory_order_relaxed);
-    void* writable_base = (readable == 0) ? seg->copy_b : seg->copy_a;
+    size_t start_word = offset / region->align;
+    size_t word_count = size / region->align;
 
     // Write word by word
     for (size_t i = 0; i < word_count; i++) {
-        size_t word_idx = start_word + i;
-
-        // Try to acquire ownership: NONE -> tx_id
-        uint32_t expected = CTRL_NONE;
-        if (likely(atomic_compare_exchange_strong(&seg->ctrl[word_idx], &expected, tx_id))) {
-            // Success! Write to writable copy
-            memcpy((uint8_t*)writable_base + word_idx * align, (const uint8_t*)source + i * align, align);
-
-            // Add to write set
-            if (unlikely(!tx_add_write(tx, seg, word_idx))) {
-                tx->aborted = true;
-                tx_cleanup(tx, false);
-                return false;
-            }
-        } else if (expected == tx_id) {
-            // We already own it - just write
-            memcpy((uint8_t*)writable_base + word_idx * align, (const uint8_t*)source + i * align, align);
-        } else {
-            // Another tx owns it - conflict
+        if (!write_word(tx, seg, start_word + i, (const uint8_t*)source + i * region->align)) {
             tx->aborted = true;
             tx_cleanup(tx, false);
             return false;
@@ -717,7 +732,7 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t tx_handle, size_t size, void** ta
     tx_internal_t* tx = (tx_internal_t*)tx_handle;
     region_t* region = tx->region;
 
-    if (unlikely(tx->aborted)) return abort_alloc;
+    if (tx->aborted) return abort_alloc;
 
     // Create new segment
     segment_t* seg = segment_create(size, region->align);
@@ -753,18 +768,18 @@ bool tm_free(shared_t unused(shared), tx_t tx_handle, void* target) {
     tx_internal_t* tx = (tx_internal_t*)tx_handle;
     region_t* region = tx->region;
 
-    if (unlikely(tx->aborted)) return false;
+    if (tx->aborted) return false;
 
     // Find segment
     segment_t* seg = find_segment_unlocked(region, target);
-    if (unlikely(!seg || seg == region->first_segment)) {
+    if (!seg || seg == region->first_segment) {
         tx->aborted = true;
         tx_cleanup(tx, false);
         return false;
     }
 
     // Add to transaction's free list
-    if (unlikely(!tx_add_free(tx, seg))) {
+    if (!tx_add_free(tx, seg)) {
         tx->aborted = true;
         tx_cleanup(tx, false);
         return false;
